@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Acme Holdings Intranet{% endblock %}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; color: #222; }
+    nav { background: #1f2d3d; padding: 12px 24px; }
+    nav a { color: #fff; margin-right: 20px; text-decoration: none; }
+    main { padding: 24px; max-width: 900px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background: #f3f4f6; }
+    .error { background: #fdecea; border: 1px solid #f5a5a0; padding: 10px; margin-bottom: 16px; }
+    .ok { background: #e8f5e9; border: 1px solid #9ccc9f; padding: 10px; margin-bottom: 16px; }
+    label { display: block; margin-top: 12px; }
+    input { padding: 6px; width: 280px; }
+    button { margin-top: 16px; padding: 8px 16px; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/inbox">Invoice Portal</a>
+    <a href="/ap">AP System</a>
+    <a href="/ap/create">New AP Invoice</a>
+  </nav>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}AP System{% endblock %}
+{% block content %}
+<h1>Accounts Payable</h1>
+{% if flash %}<div class="ok" id="flash">Invoice {{ flash }} created.</div>{% endif %}
+<p><a href="/ap/create">+ New invoice</a></p>
+<table id="ap-list">
+  <thead><tr><th>Invoice</th><th>Vendor</th><th>Amount</th><th>Invoice date</th><th>Due date</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for inv in invoices %}
+    <tr data-invoice-id="{{ inv.invoice_id }}">
+      <td>{{ inv.invoice_id }}</td><td>{{ inv.vendor }}</td><td>{{ inv.amount }}</td>
+      <td>{{ inv.invoice_date }}</td><td>{{ inv.due_date }}</td><td>{{ inv.status }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6">No invoices in AP yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

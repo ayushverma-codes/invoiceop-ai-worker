@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Invoice Portal{% endblock %}
+{% block content %}
+<h1>Vendor Invoice Portal</h1>
+<p>Received invoices ({{ invoices|length }}).</p>
+<table id="invoice-list">
+  <thead><tr><th>Invoice</th><th>Vendor</th><th>Invoice date</th><th>Amount</th></tr></thead>
+  <tbody>
+  {% for inv in invoices %}
+    <tr data-invoice-id="{{ inv.invoice_id }}">
+      <td><a href="/invoice/{{ inv.invoice_id }}">{{ inv.invoice_id }}</a></td>
+      <td>{{ inv.vendor }}</td>
+      <td>{{ inv.invoice_date }}</td>
+      <td>{{ inv.amount }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Invoice {{ inv.invoice_id }}{% endblock %}
+{% block content %}
+<h1>Invoice {{ inv.invoice_id }}</h1>
+<table id="invoice-detail">
+  <tr><th>Invoice ID</th><td id="invoice_id">{{ inv.invoice_id }}</td></tr>
+  <tr><th>Vendor</th><td id="vendor">{{ inv.vendor }}</td></tr>
+  <tr><th>Amount</th><td id="amount">{{ inv.amount }}</td></tr>
+  <tr><th>Invoice date</th><td id="invoice_date">{{ inv.invoice_date }}</td></tr>
+  <tr><th>Due date</th><td id="due_date">{{ inv.due_date }}</td></tr>
+  <tr><th>Description</th><td id="description">{{ inv.description }}</td></tr>
+</table>
+<p><a href="/inbox">&larr; Back to inbox</a></p>
+{% endblock %}

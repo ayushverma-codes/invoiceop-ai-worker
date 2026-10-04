@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}New AP Invoice{% endblock %}
+{% block content %}
+<h1>Create AP Invoice</h1>
+{% if errors %}
+<div class="error" id="form-errors">
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+<form method="post" action="/ap/create" id="ap-form">
+  <label>Invoice ID <input name="invoice_id" value="{{ values.get('invoice_id', '') }}"></label>
+  <label>Vendor <input name="vendor" value="{{ values.get('vendor', '') }}"></label>
+  <label>Amount <input name="amount" value="{{ values.get('amount', '') }}"></label>
+  <label>Invoice date (YYYY-MM-DD) <input name="invoice_date" value="{{ values.get('invoice_date', '') }}"></label>
+  <label>Due date (YYYY-MM-DD) <input name="due_date" value="{{ values.get('due_date', '') }}"></label>
+  <button type="submit" id="submit-btn">Submit invoice</button>
+</form>
+{% endblock %}
