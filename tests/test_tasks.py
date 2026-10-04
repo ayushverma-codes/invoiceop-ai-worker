@@ -2,6 +2,7 @@
 
 Each test gets its own server process and its own temp SQLite DB, so tests are independent.
 """
+import contextlib
 import os
 import pathlib
 import re
@@ -14,6 +15,7 @@ import urllib.request
 
 import pytest
 
+from tests.helpers import stop_process
 from tools.browser import Browser
 from tools.invoice import AmbiguousSelection, InvoiceData, InvoiceValidationError, VendorNotFound
 from tools.mechanical import process_latest_invoice
@@ -46,8 +48,7 @@ def app(tmp_path):
         proc.kill()
         pytest.fail("mock app did not start")
     yield {"url": url, "db": str(db)}
-    proc.kill()
-    proc.wait()
+    stop_process(proc)
 
 
 @pytest.fixture
@@ -57,7 +58,7 @@ def browser(app):
 
 
 def ap_rows(db):
-    with sqlite3.connect(db) as c:
+    with contextlib.closing(sqlite3.connect(db)) as c:
         return c.execute("SELECT invoice_id, vendor, amount, invoice_date, due_date, status FROM invoices").fetchall()
 
 

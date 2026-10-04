@@ -80,13 +80,20 @@ def _col(headers, word):
     return next(h for h in headers if word in h.lower())
 
 
+def _norm(text):
+    """'Example Co.' -> 'example co' (case, punctuation and spacing don't matter when matching names)."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
 def rows_for_vendor(table, vendor_query):
-    """Rows whose vendor cell contains the query (case-insensitive). Raises if none or if
+    """Rows whose vendor cell contains the query (ignoring case/punctuation). Raises if none or if
     the query matches more than one distinct vendor (ambiguous)."""
     vcol = _col(table["headers"], "vendor")
-    rows = [r for r in table["rows"] if vendor_query.strip().lower() in r["cells"][vcol].lower()]
+    q = _norm(vendor_query)
+    rows = [r for r in table["rows"] if q and q in _norm(r["cells"][vcol])]
     if not rows:
-        raise VendorNotFound(f"no invoices found for vendor {vendor_query!r}")
+        seen = sorted({r["cells"][vcol] for r in table["rows"]})
+        raise VendorNotFound(f"no invoices found for vendor {vendor_query!r}; vendors on this page: {seen}")
     vendors = sorted({r["cells"][vcol] for r in rows})
     if len(vendors) > 1:
         raise AmbiguousSelection(f"{vendor_query!r} matches several vendors: {vendors}")
