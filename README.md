@@ -1,36 +1,68 @@
 # invoiceop-ai-worker
 
-Autonomous AI worker for invoice processing (work in progress, Phase 1 of 5 complete).
-Phase 1 provides the mock company environment: a vendor invoice portal and an internal AP system backed by SQLite. The agent comes in later phases.
+Autonomous AI worker for invoice processing (work in progress, Phase 2 of 5 complete).
 
-## Quick start (Windows, PowerShell)
+- Phase 1: mock company environment (vendor invoice portal + internal AP system, SQLite).
+- Phase 2: real browser tools (Playwright) and a scripted end-to-end baseline. No LLM yet.
+
+## Setup (Windows, PowerShell)
 
 ```powershell
 cd invoiceop-ai-worker
-python --version                  # expect 3.14 (3.12+ should also work)
+python --version                  # expect 3.14
 python -m venv .venv
 .venv\Scripts\Activate.ps1        # if blocked: Set-ExecutionPolicy -Scope Process Bypass
 pip install -r requirements.txt
-python run.py serve --reset       # --reset re-creates and re-seeds the database
+playwright install chromium       # one-time browser download (~150 MB)
 ```
 
 macOS/Linux: `source .venv/bin/activate` instead of the Activate line.
 
-Then open in a browser:
+## Run
 
-- http://127.0.0.1:5000/inbox - vendor invoice portal (6 seeded invoices)
-- http://127.0.0.1:5000/invoice/AC-2026-104 - invoice detail
-- http://127.0.0.1:5000/ap - internal AP system (empty at first)
-- http://127.0.0.1:5000/ap/create - create an AP invoice (submit with a blank invoice date to see the validation error)
+Terminal 1 - the mock company app (keep it running):
 
-Stop the server with Ctrl+C. Data is stored in `mock_app/company.db` and persists across restarts; use `--reset` to wipe it.
+```powershell
+python run.py serve --reset       # --reset re-creates and re-seeds the database
+```
+
+Browse it: http://127.0.0.1:5000/inbox, /ap, /ap/create.
+
+Terminal 2 - scripted browser demo (add `--headed` to watch the browser work):
+
+```powershell
+python run.py demo "Acme Corp" --headed
+python run.py demo "Globex"
+python run.py demo "Umbrella"     # unknown vendor -> controlled failure
+```
+
+Run `serve --reset` again between demos, otherwise AP rejects the duplicate (that is expected behaviour).
+
+## Tests
+
+```powershell
+pytest -q
+```
+
+Each test starts its own server on a free port with a temp database and drives a real headless Chromium. Nothing needs to be running beforehand.
+
+## Optional environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `MOCK_APP_URL` | base URL the browser uses (default `http://127.0.0.1:5000`) |
+| `INVOICEOP_HEADLESS` | `0` to show the browser window |
+| `INVOICEOP_CHROMIUM_PATH` | use an existing Chrome/Chromium binary |
+| `INVOICEOP_DB` | SQLite file path used by the mock app |
 
 ## Layout
 
 ```
-agent/        (Phase 3+) LLM agent: state, nodes, prompts, graph
-tools/        (Phase 2+) browser, policy, verification, invoice tools
-mock_app/     Flask app: server.py, database.py, templates/
-tests/        (Phase 2+)
-run.py        entry point
+tools/browser.py     navigate, inspect_page, click, fill, submit (Playwright)
+tools/invoice.py     InvoiceData validation + generic vendor filtering / latest selection
+tools/mechanical.py  scripted baseline workflow (replaced by the LLM agent in Phase 3)
+mock_app/            Flask app: server.py, database.py, templates/
+agent/               (Phase 3+) state, nodes, prompts, graph
+tests/               end-to-end tests
+run.py               entry point
 ```
