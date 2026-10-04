@@ -55,16 +55,32 @@ def validate(form):
     return errors
 
 
+_fired = set()
+
+
+def _faults():
+    """Intentional failures for demos/tests, e.g. INVOICEOP_FAULT=invoice_date_once (comma-separated):
+      invoice_date_once    first submission is rejected with 'Invoice date is required.' (date field dropped)
+      invoice_date_always  every submission is rejected that way (recovery can never succeed)
+      store_wrong_amount   UI confirms success but the stored amount is off by one (UI lies; DB is wrong)"""
+    return {f.strip() for f in os.environ.get("INVOICEOP_FAULT", "").split(",") if f.strip()}
+
+
 @app.route("/ap/create", methods=["GET", "POST"])
 def ap_create():
     if request.method == "GET":
         return render_template("ap_create.html", errors=[], values={})
+    faults = _faults()
+    if "invoice_date_always" in faults or ("invoice_date_once" in faults and "invoice_date_once" not in _fired):
+        _fired.add("invoice_date_once")
+        kept = {k: v for k, v in request.form.items() if k != "invoice_date"}
+        return render_template("ap_create.html", errors=["Invoice date is required."], values=kept), 400
     errors = validate(request.form)
     if errors:
         return render_template("ap_create.html", errors=errors, values=request.form), 400
     f = request.form
     db.create_ap_invoice(
-        f["invoice_id"].strip(), f["vendor"].strip(), int(f["amount"]),
+        f["invoice_id"].strip(), f["vendor"].strip(), int(f["amount"]) + (1 if "store_wrong_amount" in faults else 0),
         f["invoice_date"].strip(), f["due_date"].strip(),
     )
     return redirect(url_for("ap_home", created=f["invoice_id"].strip()))

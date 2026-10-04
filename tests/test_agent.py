@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from agent.graph import run_agent
 from agent.llm import GroqLLM, LLMError, LLMOutputError, structured
 from agent.schema import Plan, SchemaError, Step
+from agent.trace import Trace
 from tests.fake_llm import RuleLLM, ScriptedLLM, _step
 from tests.helpers import ROOT, ap_rows, running_app
 from tools.browser import Browser
@@ -141,20 +142,24 @@ class LLMClientTests(unittest.TestCase):
 
 # --- agent loop: real browser, real server ------------------------------------------------
 class AgentLoopTests(unittest.TestCase):
-    def run_task(self, llm, task, **kw):
-        with running_app() as app, Browser(base_url=app["url"]) as b:
-            result = run_agent(task, b, llm, **kw)
+    def run_task(self, llm, task, fault="", **kw):
+        with running_app(fault) as app, Browser(base_url=app["url"]) as b:
+            result = run_agent(task, b, llm, db_path=app["db"], **kw)
             return result, ap_rows(app["db"]), b
 
     def test_latest_acme_invoice(self):
         llm = RuleLLM()
         r, rows, b = self.run_task(llm, "Process the latest invoice from Acme Corp.")
-        self.assertEqual(r["status"], "submitted_unverified")
+        self.assertEqual(r["status"], "completed")
         self.assertEqual(r["selected_invoice"]["invoice_id"], "AC-2026-104")
         self.assertEqual(rows, [ACME])
         self.assertTrue(any("AC-2026-104" in e for e in r["selected_invoice"]["evidence"]))
         self.assertEqual(r["llm_calls"], llm.calls)
         self.assertGreater(r["llm_calls"], 5)
+        # Scenario A: normal invoice -> autonomous, verified success, no approval, no retries
+        self.assertTrue(r["verification"]["passed"])
+        self.assertTrue(all(v == "PASS" for v in r["verification"]["checks"].values()))
+        self.assertEqual((r["retry_count"], r["policy"]["approval_required"]), (0, False))
         # the agent opened only the selected invoice, never the older ones
         visited = [a["result"] for a in r["actions_taken"] if a["action"] in ("navigate", "click")]
         self.assertTrue(any("/invoice/AC-2026-104" in v for v in visited))
@@ -162,7 +167,7 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_same_agent_other_vendor_different_data_only(self):
         r, rows, _ = self.run_task(RuleLLM(), "Process the latest invoice from Globex Inc.")
-        self.assertEqual(r["status"], "submitted_unverified")
+        self.assertEqual(r["status"], "completed")
         self.assertEqual([row[0] for row in rows], ["GX-2026-221"])
 
     def test_vendor_copied_with_trailing_period_still_matches(self):
@@ -173,7 +178,7 @@ class AgentLoopTests(unittest.TestCase):
         llm = KeepsPeriod()
         r, rows, _ = self.run_task(llm, "Process the latest invoice from Globex Inc.")
         self.assertEqual(r["vendor"], "Globex Inc.")
-        self.assertEqual(r["status"], "submitted_unverified")
+        self.assertEqual(r["status"], "completed")
         self.assertEqual([row[0] for row in rows], ["GX-2026-221"])
 
     def test_unknown_vendor_controlled_failure_nothing_written(self):
@@ -199,7 +204,7 @@ class AgentLoopTests(unittest.TestCase):
                 return out
 
         r, rows, _ = self.run_task(Liar(), "Process the latest invoice from Acme Corp.")
-        self.assertEqual(r["status"], "submitted_unverified")
+        self.assertEqual(r["status"], "completed")
         self.assertTrue(any("not found on the current page" in e for e in r["errors"]))
         self.assertEqual(rows, [ACME])  # DB holds the real amount, not the hallucinated one
 
@@ -281,7 +286,7 @@ class AgentLoopTests(unittest.TestCase):
                 return super().complete(messages)
 
         r, rows, _ = self.run_task(Flaky(), "Process the latest invoice from Acme Corp.")
-        self.assertEqual((r["status"], rows), ("submitted_unverified", [ACME]))
+        self.assertEqual((r["status"], rows), ("completed", [ACME]))
 
     def test_persistently_malformed_output_fails_cleanly(self):
         llm = ScriptedLLM(['{"intent":"process_invoice","vendor":"V","steps":[]}'] + ["nope"] * 3)
@@ -289,6 +294,204 @@ class AgentLoopTests(unittest.TestCase):
             r = run_agent("Process the latest invoice from V", b, llm)
         self.assertEqual(r["status"], "failed")
         self.assertIn("invalid model output", r["reason"])
+
+
+# --- Phase 4: recovery, approval policy, independent verification -------------------------------
+class ReliabilityTests(unittest.TestCase):
+    def run_task(self, llm, task, fault="", approver=None, **kw):
+        with running_app(fault) as app, Browser(base_url=app["url"]) as b:
+            trace = Trace(verbose=False)
+            result = run_agent(task, b, llm, db_path=app["db"], approver=approver, trace=trace, **kw)
+            return result, ap_rows(app["db"]), trace
+
+    # Scenario B: AP rejects the first submission -> agent reads the error, fixes the cause, retries
+    def test_ap_rejection_is_recovered_from_the_observed_error(self):
+        r, rows, trace = self.run_task(RuleLLM(), "Process the latest invoice from Acme Corp.", fault="invoice_date_once")
+        self.assertEqual(r["status"], "completed")
+        self.assertEqual((r["retry_count"], r["recovered"]), (1, True))
+        self.assertIn("Invoice date is required.", r["errors"])
+        self.assertEqual(rows, [ACME])
+        subs = [a for a in r["actions_taken"] if a["action"] == "submit"]
+        self.assertEqual([a["result"].startswith("AP rejected") for a in subs], [True, False])
+        fixes = [a for a in r["actions_taken"] if a["action"] == "fill_form"][-1]
+        self.assertEqual(list(fixes["args"]["fields"]), ["invoice_date"])  # changed only what the error pointed at
+        self.assertTrue(any(tag == "RECOVERY" for tag, _ in trace.events))
+
+    def test_blind_resubmit_after_rejection_is_blocked(self):
+        class Impatient(RuleLLM):
+            tried = False
+
+            def decide(self, user):
+                if not self.tried and "Invoice date is required." in user:
+                    self.tried = True
+                    return _step("submit", "just try again")
+                return super().decide(user)
+
+        r, rows, _ = self.run_task(Impatient(), "Process the latest invoice from Acme Corp.", fault="invoice_date_once")
+        self.assertTrue(any("nothing has changed since" in e for e in r["errors"]))
+        self.assertEqual((r["status"], rows), ("completed", [ACME]))
+
+    def test_retries_are_bounded_when_ap_never_accepts(self):
+        r, rows, _ = self.run_task(RuleLLM(), "Process the latest invoice from Acme Corp.", fault="invoice_date_always")
+        self.assertEqual(r["status"], "failed")
+        self.assertEqual(r["retry_count"], 4)  # first rejection + 3 retries, then stop
+        self.assertIn("kept rejecting", r["reason"])
+        self.assertEqual(rows, [])
+        self.assertLess(r["steps"], 20)
+
+    # Scenario C: high-value invoice -> human approval before anything is written
+    def test_high_value_invoice_asks_human_and_proceeds_when_approved(self):
+        asked = []
+        def approver(inv):
+            asked.append(inv)
+            return True
+        r, rows, trace = self.run_task(RuleLLM(), "Process the latest invoice from Initech LLC.", approver=approver)
+        self.assertEqual(r["status"], "completed")
+        self.assertEqual([a["invoice_id"] for a in asked], ["IN-2026-310"])
+        self.assertEqual(r["policy"], {"approval_required": True, "approval_status": "approved", "threshold": 200000})
+        self.assertEqual(rows[0][:3], ("IN-2026-310", "Initech LLC", 500000))
+        self.assertEqual(r["verification"]["checks"]["approval_respected"], "PASS")
+
+    def test_high_value_invoice_denied_writes_nothing(self):
+        r, rows, _ = self.run_task(RuleLLM(), "Process the latest invoice from Initech LLC.", approver=lambda inv: False)
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("denied", r["reason"])
+        self.assertEqual(rows, [])
+
+    def test_high_value_invoice_without_approver_pauses_before_submission(self):
+        r, rows, _ = self.run_task(RuleLLM(), "Process the latest invoice from Initech LLC.")
+        self.assertEqual(r["status"], "waiting_for_approval")
+        self.assertEqual(r["policy"]["approval_status"], "pending")
+        self.assertEqual(rows, [])
+
+    def test_below_threshold_never_asks(self):
+        def boom(inv):
+            raise AssertionError("approver must not be called")
+        r, rows, _ = self.run_task(RuleLLM(), "Process the latest invoice from Globex Inc.", approver=boom)
+        self.assertEqual(r["status"], "completed")
+
+    def test_llm_cannot_bypass_policy_by_clicking_the_form_button(self):
+        llm = ScriptedLLM(['{"intent":"process_invoice","vendor":"V","steps":[]}',
+                           _step("navigate", "open form", url="/ap/create"),
+                           _step("click", "press submit", target="Submit invoice"),
+                           _step("click", "press submit via selector", target="#submit-btn"),
+                           _step("finish", "stop", outcome="failed", reason="r")])
+        r, rows, _ = self.run_task(llm, "Process the latest invoice from V")
+        self.assertEqual(sum("cannot be clicked directly" in e for e in r["errors"]), 2)
+        self.assertEqual(rows, [])
+
+    def test_submit_requires_extracted_data(self):
+        llm = ScriptedLLM(['{"intent":"process_invoice","vendor":"V","steps":[]}',
+                           _step("navigate", "open form", url="/ap/create"),
+                           _step("submit", "submit empty"),
+                           _step("finish", "stop", outcome="failed", reason="r")])
+        r, rows, _ = self.run_task(llm, "Process the latest invoice from V")
+        self.assertTrue(any("extract_invoice must be done before submit" in e for e in r["errors"]))
+        self.assertEqual(rows, [])
+
+    # Scenario D: the UI says success but the stored record is wrong -> NOT reported as success
+    def test_verification_failure_is_not_reported_as_success(self):
+        r, rows, trace = self.run_task(RuleLLM(), "Process the latest invoice from Acme Corp.", fault="store_wrong_amount")
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("amount_matches", r["reason"])
+        self.assertEqual(r["verification"]["checks"]["amount_matches"], "FAIL")
+        self.assertEqual(r["verification"]["checks"]["vendor_matches"], "PASS")
+        self.assertEqual(rows[0][2], 125001)  # the UI had confirmed success; the DB disagrees
+        self.assertFalse(r["recovered"])
+
+    def test_completed_only_comes_from_verifier_not_from_llm_claim(self):
+        """Agent says done, AP page confirmed, but the verifier finds no record -> failed."""
+        import tempfile, os
+        from mock_app.database import SCHEMA
+        import sqlite3, contextlib
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            empty_db = os.path.join(tmp, "other.db")
+            with contextlib.closing(sqlite3.connect(empty_db)) as c:
+                c.executescript(SCHEMA)
+            with running_app() as app, Browser(base_url=app["url"]) as b:
+                r = run_agent("Process the latest invoice from Acme Corp.", b, RuleLLM(), db_path=empty_db)
+        self.assertEqual(r["status"], "failed")
+        self.assertEqual(r["verification"]["checks"]["invoice_exists"], "FAIL")
+
+
+class VerifierAndPolicyUnitTests(unittest.TestCase):
+    INV = {"invoice_id": "T-1", "vendor": "V Co", "amount": 100, "invoice_date": "2026-01-01", "due_date": "2026-02-01"}
+
+    def make_db(self, tmp, ap=None, source=True):
+        import contextlib, os, sqlite3
+        from mock_app.database import SCHEMA
+        path = os.path.join(tmp, "v.db")
+        with contextlib.closing(sqlite3.connect(path)) as c:
+            c.executescript(SCHEMA)
+            if source:
+                c.execute("INSERT INTO inbox_invoices VALUES ('T-1','V Co',100,'2026-01-01','2026-02-01','x')")
+            if ap:
+                c.execute("INSERT INTO invoices VALUES (?,?,?,?,?,?)", ap)
+            c.commit()
+        return path
+
+    def verify(self, **kw):
+        import tempfile
+        from tools.verification import verify_submission
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = self.make_db(tmp, **{k: v for k, v in kw.items() if k in ("ap", "source")})
+            return verify_submission(kw.get("path", path), kw.get("inv", self.INV), kw.get("approval"))
+
+    GOOD = ("T-1", "V Co", 100, "2026-01-01", "2026-02-01", "submitted")
+
+    def test_all_pass(self):
+        v = self.verify(ap=self.GOOD)
+        self.assertTrue(v["passed"])
+        self.assertEqual(set(v["checks"].values()), {"PASS"})
+
+    def test_missing_record(self):
+        v = self.verify(ap=None)
+        self.assertFalse(v["passed"])
+        self.assertEqual(v["checks"]["invoice_exists"], "FAIL")
+
+    def test_each_field_mismatch_is_caught(self):
+        for idx, check in ((1, "vendor_matches"), (2, "amount_matches"), (3, "invoice_date_matches"), (4, "due_date_matches")):
+            row = list(self.GOOD)
+            row[idx] = "999" if idx != 2 else 999
+            v = self.verify(ap=tuple(row))
+            self.assertEqual(v["checks"][check], "FAIL", check)
+            self.assertFalse(v["passed"])
+
+    def test_wrong_status(self):
+        v = self.verify(ap=self.GOOD[:5] + ("pending",))
+        self.assertEqual(v["checks"]["status_confirmed"], "FAIL")
+
+    def test_extraction_that_differs_from_source_is_caught(self):
+        bad = dict(self.INV, amount=101)
+        v = self.verify(ap=("T-1", "V Co", 101, "2026-01-01", "2026-02-01", "submitted"), inv=bad)
+        self.assertEqual(v["checks"]["amount_matches"], "PASS")   # AP == what the agent entered...
+        self.assertEqual(v["checks"]["matches_source_record"], "FAIL")  # ...but that was wrong vs the source
+
+    def test_unreadable_database_fails_cleanly(self):
+        from tools.verification import verify_submission
+        v = verify_submission("/nonexistent/dir/x.db", self.INV)
+        self.assertFalse(v["passed"])
+        self.assertEqual(v["checks"]["database_readable"], "FAIL")
+
+    def test_approval_respected_check(self):
+        big = dict(self.INV, amount=250000)
+        row = ("T-1", "V Co", 250000, "2026-01-01", "2026-02-01", "submitted")
+        self.assertEqual(self.verify(ap=row, inv=big, approval=None)["checks"]["approval_respected"], "FAIL")
+        self.assertEqual(self.verify(ap=row, inv=big, approval="approved")["checks"]["approval_respected"], "PASS")
+
+    def test_policy_threshold_is_strictly_greater_than(self):
+        from tools.policy import requires_approval
+        self.assertFalse(requires_approval({"amount": 200000}))
+        self.assertTrue(requires_approval({"amount": 200001}))
+
+    def test_threshold_is_configurable_by_env(self):
+        import os
+        from tools.policy import requires_approval
+        os.environ["APPROVAL_THRESHOLD"] = "1000"
+        try:
+            self.assertTrue(requires_approval({"amount": 1001}))
+        finally:
+            del os.environ["APPROVAL_THRESHOLD"]
 
 
 class VendorMatchTests(unittest.TestCase):

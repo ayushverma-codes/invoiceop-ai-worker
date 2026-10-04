@@ -6,14 +6,18 @@ Split of responsibility:
 The LLM can never touch the browser, the database, or the final status directly.
 """
 import json
+import os
 from dataclasses import dataclass
 
 from agent.llm import LLMError, LLMOutputError, structured
 from agent.prompts import AGENT_SYSTEM, PLANNER_SYSTEM
 from agent.schema import Plan, Step
-from tools.browser import BrowserError
+from tools.browser import SELECTOR_PREFIXES, BrowserError
 from tools.invoice import FIELDS, InvoiceData, InvoiceError, find_invoice_table, rows_for_vendor
+from tools.policy import approval_threshold, requires_approval
+from tools.verification import verify_submission
 
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))  # AP rejections tolerated before giving up
 MAX_CONSECUTIVE_FAILURES = 3
 MAX_IDENTICAL_ACTIONS = 3
 HISTORY_LINES = 14
@@ -29,6 +33,8 @@ class Ctx:
     llm: object
     trace: object
     max_steps: int = 20
+    db_path: str | None = None   # AP database the independent verifier reads
+    approver: object = None      # callable(invoice) -> bool; None = pause with waiting_for_approval
 
 
 def _fail(state, ctx, status, reason):
@@ -161,6 +167,11 @@ def _x_navigate(state, ctx, s):
 
 
 def _x_click(state, ctx, s):
+    # A form button/selector could submit the form and bypass the submit action (and its policy gate).
+    if state.page_observation.get("forms"):
+        buttons = [b for fm in state.page_observation["forms"] for b in fm["buttons"]]
+        if s.target in buttons or s.target.startswith(SELECTOR_PREFIXES):
+            raise GuardError("form buttons/selectors cannot be clicked directly; use fill_form, then the submit action")
     return f"clicked {s.target!r}, now at {ctx.browser.click(s.target)['url']}"
 
 
@@ -218,17 +229,56 @@ def _x_fill_form(state, ctx, s):
     return f"filled {', '.join(s.fields)}"
 
 
+def _unfixed_rejection(state):
+    """True if AP rejected the last submit and the agent has changed nothing since."""
+    for a in reversed(state.actions_taken):
+        if not a["ok"]:
+            continue
+        if a["action"] in ("fill_form", "navigate"):
+            return False
+        if a["action"] == "submit":
+            return a["result"].startswith("AP rejected")
+    return False
+
+
 def _x_submit(state, ctx, s):
+    if not state.invoice_data:
+        raise GuardError("extract_invoice must be done before submit")
+    if _unfixed_rejection(state):
+        raise GuardError("AP rejected the last submission and nothing has changed since; use fill_form to fix "
+                         "the cause (see the error message and the form's current values), then submit again")
+    # --- deterministic policy gate: runs BEFORE anything is written to AP ---
+    if requires_approval(state.invoice_data):
+        state.approval_required = True
+        if state.approval_status in (None, "pending"):
+            ctx.trace.log("POLICY", f"amount {state.invoice_data['amount']} exceeds threshold "
+                                    f"{approval_threshold()}: human approval required")
+            if ctx.approver is None:
+                state.approval_status = "pending"
+                state.final_status = "waiting_for_approval"
+                state.final_reason = "high-value invoice: paused before submission, awaiting human approval"
+                return "paused before submission: waiting for human approval"
+            state.approval_status = "approved" if ctx.approver(dict(state.invoice_data)) else "denied"
+            ctx.trace.log("APPROVAL", state.approval_status)
+        if state.approval_status == "denied":
+            state.final_status, state.final_reason = "failed", "human denied approval; nothing was submitted"
+            return "not submitted: approval denied"
     state.submitted_ok = False
     r = ctx.browser.submit()
     after = ctx.browser.inspect_page()
     errors = [m["text"] for m in after["messages"] if m["kind"] == "error"]
     oks = [m["text"] for m in after["messages"] if m["kind"] == "ok"]
-    inv_id = state.invoice_data["invoice_id"] if state.invoice_data else None
+    inv_id = state.invoice_data["invoice_id"]
     if errors:
         state.errors.extend(errors)
+        state.retry_count += 1
+        ctx.trace.log("RECOVERY", f"AP rejected the submission (rejection {state.retry_count}, "
+                                  f"max retries {MAX_RETRIES}): {errors}")
+        if state.retry_count > MAX_RETRIES:
+            state.final_status = "failed"
+            state.final_reason = f"AP kept rejecting the submission after {MAX_RETRIES} retries: {errors}"
         return f"AP rejected the submission (HTTP {r['status']}): {errors}"
-    if oks and (inv_id is None or any(inv_id in t for t in oks)):
+    if any(inv_id in text for text in oks):
         state.submitted_ok = True
         return f"AP confirmed (HTTP {r['status']}): {oks[0]}"
     return f"submitted (HTTP {r['status']}) but the page showed no confirmation"
@@ -238,7 +288,8 @@ def _x_finish(state, ctx, s):
     if s.outcome == "done":
         if not state.submitted_ok:
             raise GuardError("finish 'done' rejected: no AP submission has been confirmed by the page")
-        state.final_status, state.final_reason = "submitted_unverified", s.reason
+        # not final yet: the independent verifier (verify_node) decides whether this claim is true
+        state.claimed_done, state.final_reason = True, s.reason
     else:
         state.final_status, state.final_reason = s.outcome, s.reason  # "failed" | "needs_clarification"
     return f"finished: {s.outcome}"
@@ -272,3 +323,21 @@ def act_node(state, ctx):
     elif len(state.actions_taken) >= MAX_CONSECUTIVE_FAILURES and not any(
             a["ok"] for a in state.actions_taken[-MAX_CONSECUTIVE_FAILURES:]):
         _fail(state, ctx, "failed", f"{MAX_CONSECUTIVE_FAILURES} consecutive failed actions; giving up")
+
+
+def verify_node(state, ctx):
+    """Independent check of the real database. The agent's own claim is never evidence."""
+    ctx.trace.log("VERIFY", "agent claims done; checking the AP database independently")
+    result = verify_submission(ctx.db_path, state.invoice_data, state.approval_status)
+    state.verification_result = result
+    for name, outcome in result["checks"].items():
+        extra = f" ({result['details'][name]})" if outcome == "FAIL" else ""
+        ctx.trace.log("VERIFY", f"{name}={outcome}{extra}")
+    if result["passed"]:
+        state.final_status = "completed"
+        state.final_reason = f"verified in database: {state.final_reason}"
+    else:
+        failed = [n for n, o in result["checks"].items() if o == "FAIL"]
+        state.final_status = "failed"
+        state.final_reason = f"verification failed ({', '.join(failed)}): the UI reported success but the stored record is not correct"
+    ctx.trace.log("RESULT", f"{state.final_status}: {state.final_reason}")

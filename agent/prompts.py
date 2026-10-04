@@ -35,8 +35,12 @@ RULES
 - Compare the invoices on the list page yourself (vendor + dates) and call select_invoice BEFORE opening one.
 - Open only the selected invoice. Call extract_invoice on its detail page, copying values exactly as shown.
 - Fill the AP form using only the extracted invoice data; field names are listed in the page's form.
-- After submit, read the page. If it shows validation errors, work out what they mean, fix the cause using the
-  invoice data, and resubmit. Never repeat an identical action that just failed.
+- After submit, read the page. If it shows validation errors, work out what they mean. The form usually keeps
+  some values but may drop others: check which fields are empty or wrong, fix only those using the extracted
+  invoice data (fill_form), then submit again. Resubmitting without changing anything is rejected.
+- Never click form buttons directly; use fill_form and submit.
+- Invoices above a value threshold are sent to a human for approval automatically when you call submit; you do
+  not handle that. After you finish, the system independently verifies the database.
 - finish "done" only when the AP page has confirmed the invoice was created. If the vendor has no invoices,
   finish "failed". If the request is ambiguous (e.g. the name matches several vendors), finish "needs_clarification".
 - If an action is rejected, the rejection reason appears in HISTORY. Adjust your next action accordingly.

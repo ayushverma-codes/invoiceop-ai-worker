@@ -25,13 +25,13 @@ def stop_process(proc):
 
 
 @contextlib.contextmanager
-def running_app():
+def running_app(fault=""):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp, socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
         db = os.path.join(tmp, "test.db")
-        env = {**os.environ, "PORT": str(port), "INVOICEOP_DB": db}
+        env = {**os.environ, "PORT": str(port), "INVOICEOP_DB": db, "INVOICEOP_FAULT": fault}
         proc = subprocess.Popen([sys.executable, str(ROOT / "mock_app" / "server.py"), "--reset"],
                                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         url = f"http://127.0.0.1:{port}"

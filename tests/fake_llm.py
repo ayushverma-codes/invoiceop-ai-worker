@@ -47,8 +47,10 @@ class RuleLLM:
         if forms and st["invoice_data"]:
             form = forms[0]["fields"]
             empty = [f["name"] for f in form if not f["value"]]
-            if empty:
-                return _step("fill_form", "fill the AP form from extracted data", fields=st["invoice_data"])
+            if empty:  # fill only what is missing (all fields on a fresh form; just the dropped one after an AP error)
+                return _step("fill_form", "fill the empty AP form fields from extracted data",
+                             ["empty fields: " + ", ".join(empty)],
+                             fields={k: v for k, v in st["invoice_data"].items() if k in empty})
             return _step("submit", "form is filled", ["all fields populated"])
         if st["invoice_data"]:
             return _step("navigate", "open the AP create form", url="/ap/create")

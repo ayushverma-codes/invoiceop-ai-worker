@@ -1,10 +1,11 @@
 # invoiceop-ai-worker
 
-Autonomous AI worker for invoice processing (work in progress, Phase 3 of 5 complete).
+Autonomous AI worker for invoice processing (work in progress, Phase 4 of 5 complete).
 
 - Phase 1: mock company environment (vendor invoice portal + internal AP system, SQLite).
 - Phase 2: real browser tools (Playwright) and a scripted end-to-end baseline. No LLM yet.
 - Phase 3: LLM-driven agent loop (observe -> reason -> act) over the same browser tools.
+- Phase 4: observation-based recovery with bounded retries, deterministic approval policy, independent database verifier.
 
 ## Setup (Windows, PowerShell)
 
@@ -49,8 +50,32 @@ python run.py agent "Process the latest invoice from Globex Inc."
 ```
 
 The run prints a tagged trace ([PLAN] [OBSERVE] [DECISION] [EVIDENCE] [ACTION] [EXTRACT] [ERROR] [RESULT])
-and a JSON result. Status `submitted_unverified` means the AP page confirmed the submission; independent
-database verification (-> `completed`) arrives in Phase 4. Reset the DB between runs (duplicates are rejected).
+and a JSON result. Final statuses: `completed` (only after the independent DB verifier passes every check), `failed`,
+`waiting_for_approval`, `needs_clarification`. Reset the DB between runs (duplicates are rejected).
+
+### Phase 4 demo scenarios
+
+```powershell
+# B. recovery: AP rejects the first submission with "Invoice date is required."
+python run.py serve --reset --fault invoice_date_once
+python run.py agent "Process the latest invoice from Acme Corp."
+
+# C. human approval (Initech's invoice is 500000 > 200000): prompts Approve? [y/n] before anything is written
+python run.py serve --reset
+python run.py agent "Process the latest invoice from Initech LLC."
+#   add --no-approver to stop with status waiting_for_approval instead of prompting
+
+# D. the UI says success but AP stored a wrong amount: verifier catches it -> failed, never completed
+python run.py serve --reset --fault store_wrong_amount
+python run.py agent "Process the latest invoice from Acme Corp."
+```
+
+Other faults: `invoice_date_always` (AP never accepts -> retries are bounded, then `failed`).
+
+**Safety design.** The LLM proposes one action per turn; deterministic code decides what is allowed:
+- policy gate inside `submit` (amount > `APPROVAL_THRESHOLD` -> human approval first); form buttons cannot be clicked directly, so it cannot be bypassed
+- after an AP rejection the agent must change something (`fill_form`) before resubmitting; at most `MAX_RETRIES` retries
+- `finish(done)` only makes the *claim*; `tools/verification.py` reads SQLite read-only and checks existence, vendor, amount, dates, status, agreement with the source portal record, and that approval was respected
 
 How it works: the LLM returns ONE structured action per turn (decision + short evidence + action). Deterministic
 guards validate it before execution: invoice must be on the observed list and belong to the requested vendor,
@@ -80,11 +105,16 @@ Each test starts its own server on a free port with a temp database and drives a
 | `GROQ_API_KEY` | required for `run.py agent` |
 | `LLM_MODEL` | default `openai/gpt-oss-20b` |
 | `LLM_REASONING_EFFORT` | `low` (default) / `medium` / `high` |
+| `APPROVAL_THRESHOLD` | default `200000`; amounts strictly above need approval |
+| `MAX_RETRIES` | default `3`; AP rejections tolerated |
+| `INVOICEOP_FAULT` | set by `serve --fault X`: `invoice_date_once`, `invoice_date_always`, `store_wrong_amount` |
 
 ## Layout
 
 ```
 tools/browser.py     navigate, inspect_page, click, fill, submit (Playwright)
+tools/policy.py      approval threshold + CLI approver (deterministic)
+tools/verification.py independent read-only SQLite verifier (PASS/FAIL checks)
 tools/invoice.py     InvoiceData validation + generic vendor filtering / latest selection
 tools/mechanical.py  scripted baseline workflow (replaced by the LLM agent in Phase 3)
 mock_app/            Flask app: server.py, database.py, templates/

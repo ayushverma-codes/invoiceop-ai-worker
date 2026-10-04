@@ -1,8 +1,8 @@
 """Entry point.
 
-  python run.py serve [--reset]              start the mock company app (keep this running)
+  python run.py serve [--reset] [--fault X]  start the mock company app (keep this running)
   python run.py demo "<vendor>" [--headed]   Phase 2 scripted baseline through a real browser
-  python run.py agent "<task>" [--headed]    Phase 3 LLM agent (needs GROQ_API_KEY in .env)
+  python run.py agent "<task>" [--headed] [--no-approver]   LLM agent (needs GROQ_API_KEY in .env)
 """
 import json
 import sys
@@ -16,7 +16,11 @@ except (AttributeError, ValueError):
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "serve":
+        import os
         from mock_app.server import app, create_app
+        if "--fault" in sys.argv:  # e.g. --fault invoice_date_once  (see mock_app/server.py)
+            os.environ["INVOICEOP_FAULT"] = sys.argv[sys.argv.index("--fault") + 1]
+            print(f"Fault injection ON: {os.environ['INVOICEOP_FAULT']}")
         create_app(reset_db="--reset" in sys.argv)
         print("Mock company app: http://127.0.0.1:5000/inbox  |  http://127.0.0.1:5000/ap")
         app.run(host="127.0.0.1", port=5000, debug=False)
@@ -41,9 +45,10 @@ def main():
         from agent.llm import GroqLLM, LLMError
         from agent.trace import Trace
         from tools.browser import Browser
+        from tools.policy import cli_approver
         args = [a for a in sys.argv[2:] if not a.startswith("--")]
         if not args:
-            print('Usage: python run.py agent "<task>" [--headed]')
+            print('Usage: python run.py agent "<task>" [--headed] [--no-approver]')
             sys.exit(1)
         try:
             llm = GroqLLM()
@@ -51,10 +56,11 @@ def main():
             print(f"Setup problem: {e}")
             sys.exit(1)
         with Browser(headless="--headed" not in sys.argv) as b:
-            result = run_agent(args[0], b, llm, trace=Trace(verbose=True))
+            approver = None if "--no-approver" in sys.argv else cli_approver
+            result = run_agent(args[0], b, llm, trace=Trace(verbose=True), approver=approver)
         result.pop("actions_taken")
-        print(json.dumps(result, indent=2))
-        sys.exit(0 if result["status"] == "submitted_unverified" else 2)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit({"completed": 0, "waiting_for_approval": 3}.get(result["status"], 2))
     else:
         print(f"Unknown command: {cmd}. Available: serve [--reset], demo \"<vendor>\" [--headed], agent \"<task>\" [--headed]")
         sys.exit(1)
